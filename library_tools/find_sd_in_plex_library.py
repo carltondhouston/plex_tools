@@ -5,6 +5,9 @@ find_sd_in_plex_library.py
 Scan a Plex library for SD videos and print them.
 An item is considered SD if its maximum available height is below the threshold (default 720).
 
+Danger: deletion options remove files from disk. Run on the Plex server or on a host that sees the same paths.
+After deleting, run a library scan in Plex to clean up missing items.
+
 Env vars are loaded from .env:
   PLEX_URL
   PLEX_API_TOKEN
@@ -14,6 +17,8 @@ Usage:
   python find_sd_in_plex_library.py "TV Shows" --csv sd_tv.csv
   python find_sd_in_plex_library.py "Movies" --insecure
   python find_sd_in_plex_library.py "Movies" --paths-only
+  python find_sd_in_plex_library.py "Movies" --delete
+  python find_sd_in_plex_library.py "Movies" --delete-no-confirm
 """
 
 import os
@@ -57,17 +62,14 @@ def item_max_height(item) -> Optional[int]:
     try:
         for m in getattr(item, "media", []) or []:
             h = None
-            # Prefer explicit height on Media when present
             if getattr(m, "height", None):
                 try:
                     h = int(m.height)
                 except Exception:
                     h = None
-            # Fallback to videoResolution mapping
             if not h:
                 vr = getattr(m, "videoResolution", None)
                 h = res_to_height(vr)
-            # Last resort, inspect streams for video height
             if not h:
                 try:
                     for p in getattr(m, "parts", []) or []:
@@ -172,6 +174,43 @@ def find_sd_items(section: LibrarySection, min_hd_height: int = 720, log: loggin
         log.warning("Library type %s is not supported for SD scan", section.type)
 
 
+def confirm(prompt: str) -> bool:
+    """Ask a yes or no question. Default is No."""
+    try:
+        ans = input(f"{prompt} [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return ans in ("y", "yes")
+
+
+def delete_paths(paths: List[str], no_confirm: bool, log: logging.Logger) -> int:
+    """
+    Delete each file path. Returns count of successful deletions.
+    Paths should be absolute and visible from this host.
+    """
+    deleted = 0
+    for p in paths:
+        if not p:
+            continue
+        if not os.path.isabs(p):
+            log.warning("Skipping non absolute path: %s", p)
+            continue
+        if not no_confirm:
+            if not confirm(f"Delete file: {p}"):
+                log.info("Skipped %s", p)
+                continue
+        try:
+            if not os.path.exists(p):
+                log.warning("File does not exist: %s", p)
+                continue
+            os.remove(p)
+            deleted += 1
+            print(f"Deleted: {p}")
+        except Exception as e:
+            log.error("Failed to delete %s: %s", p, e)
+    return deleted
+
+
 # ----------------------------- entry point ------------------------------- #
 
 def main():
@@ -184,10 +223,16 @@ def main():
                         help="Height threshold for HD. Items with max height below this are treated as SD. Default 720")
     parser.add_argument("--paths-only", action="store_true",
                         help="Only output absolute file paths for SD results, one per line. If --csv is set, write a one-column CSV with header 'path'.")
+    parser.add_argument("--delete", action="store_true",
+                        help="Delete each SD file path with per file confirmation.")
+    parser.add_argument("--delete-no-confirm", action="store_true",
+                        help="Delete SD file paths without prompting. Use with care.")
     args = parser.parse_args()
 
+    # Logging: quiet when paths only or deleting, unless debug
+    quiet_default = args.paths_only or args.delete or args["delete_no_confirm"] if isinstance(args, dict) else (args.paths_only or args.delete or args.delete_no_confirm)
     logging.basicConfig(
-        level=(logging.DEBUG if args.debug else (logging.WARNING if args.paths_only else logging.INFO)),
+        level=logging.DEBUG if args.debug else (logging.WARNING if quiet_default else logging.INFO),
         format="%(levelname)s: %(message)s",
     )
     log = logging.getLogger("sd-scan")
@@ -221,7 +266,6 @@ def main():
     try:
         section = plex.library.section(args.library_name)
     except Exception as e:
-        # In paths-only mode we still show this once
         log.error("Could not open library %s: %s", args.library_name, e)
         try:
             libs = ", ".join([s.title for s in plex.library.sections()])
@@ -230,20 +274,46 @@ def main():
             pass
         sys.exit(3)
 
-    if not args.paths_only:
+    if not quiet_default:
         log.info("Scanning library %s (%s) for SD videos", section.title, section.type)
 
     rows = list(find_sd_items(section, min_hd_height=args.threshold, log=log))
 
+    # Build a unique, deterministic list of absolute file paths
+    seen = set()
+    out_paths: List[str] = []
+    for r in rows:
+        for p in r.get("paths", []):
+            if p and p not in seen:
+                seen.add(p)
+                out_paths.append(p)
+
+    # Deletion flow
+    if args.delete or args.delete_no_confirm:
+        if not out_paths:
+            log.info("No SD file paths found to delete.")
+            return
+        if args.delete_no_confirm:
+            print("Deleting files without confirmation. Use with care.")
+        deleted = delete_paths(out_paths, no_confirm=args.delete_no_confirm, log=log)
+        print(f"Deleted {deleted} of {len(out_paths)} file(s).")
+        # Optional CSV in delete mode, write list of attempted paths and status simple
+        if args.csv:
+            try:
+                with open(args.csv, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(["path"])
+                    for p in out_paths:
+                        w.writerow([p])
+                log.info("Wrote CSV of targeted paths to %s", args.csv)
+            except Exception as e:
+                log.error("Failed to write CSV %s: %s", args.csv, e)
+                sys.exit(4)
+        # Tip: you can trigger a library scan in Plex manually after deletions
+        return
+
+    # Paths only flow
     if args.paths_only:
-        # Unique, deterministic order
-        seen = set()
-        out_paths: List[str] = []
-        for r in rows:
-            for p in r.get("paths", []):
-                if p and p not in seen:
-                    seen.add(p)
-                    out_paths.append(p)
         for p in out_paths:
             print(p)
         if args.csv:
@@ -294,3 +364,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
